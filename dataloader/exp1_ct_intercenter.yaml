@@ -1,0 +1,21 @@
+# configs/3d/exp1_ct_intercenter.yaml
+#
+# EXP 1: same modality, inter-center
+# Train: CT (A, B)   Test: CT (G)
+
+name: exp1_ct_intercenter
+
+train:
+  - {center: A, modality: CT}
+  - {center: B, modality: CT}
+
+test:
+  - {center: G, modality: CT}
+
+# Whole Heart labels — background implicit at 0
+classes: [background, LV, RV, LA, RA, Myo, AO, PA]
+
+# nnU-Net-style patch sampling config (used by the Dataset, not nnU-Net itself,
+# if you train your custom V-Net instead of nnU-Net proper)
+patch_size: [128, 128, 128]
+target_spacing: [1.0, 1.0, 1.0]   # resample all volumes to this spacing before patching

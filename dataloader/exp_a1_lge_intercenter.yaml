@@ -1,0 +1,29 @@
+# configs/2d/exp_a1_lge_intercenter.yaml
+#
+# (a) Same Sequence Inter-Center — EXP 1
+# Train: LGE (A, B, C)   Test: LGE (E, F, G, H)
+#
+# This is the ONLY file you write per experiment. The Dataset class
+# resolves "train"/"test" lists below into actual slice rows by
+# filtering metadata_myo2d_slices.csv on (center, sequence).
+
+name: exp_a1_lge_intercenter
+
+train:
+  - {center: A, sequence: LGE}
+  - {center: B, sequence: LGE}
+  - {center: C, sequence: LGE}
+
+test:
+  - {center: E, sequence: LGE}
+  - {center: F, sequence: LGE}
+  - {center: G, sequence: LGE}
+  - {center: H, sequence: LGE}
+
+# classes finalized for this run — must match LABEL_MAP remap in
+# extract_slices_myo2d.py. background is implicit at index 0.
+classes: [background, LV, Myo, Scar]
+
+# optional: cap slices per case during train for class-balance control,
+# leave null to use every extracted slice
+max_slices_per_case: null
