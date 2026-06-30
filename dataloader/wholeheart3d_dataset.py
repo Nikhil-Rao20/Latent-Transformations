@@ -83,7 +83,25 @@ class WholeHeart3DDataset(Dataset):
         img_nii = nib.load(row["image_path"])
         lbl_nii = nib.load(row["label_path"])
         img = img_nii.get_fdata().astype(np.float32)
-        lbl = lbl_nii.get_fdata().astype(np.uint8)
+        lbl = lbl_nii.get_fdata().astype(np.uint16)
+
+        # raw label codes -> class indices
+        label_map = {
+            0: 0,      # background
+            500: 1,    # LV
+            600: 2,    # RV
+            420: 3,    # LA
+            550: 4,    # RA
+            205: 5,    # Myo
+            820: 6,    # AO
+            850: 7,    # PA
+        }
+
+        lbl_mapped = np.zeros_like(lbl, dtype=np.uint8)
+        for raw_val, new_val in label_map.items():
+            lbl_mapped[lbl == raw_val] = new_val
+
+        lbl = lbl_mapped
 
         orig_spacing = img_nii.header.get_zooms()[:3]
         zoom_factors = [o / t for o, t in zip(orig_spacing, self.target_spacing)]

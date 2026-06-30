@@ -17,5 +17,5 @@ classes: [background, LV, RV, LA, RA, Myo, AO, PA]
 
 # nnU-Net-style patch sampling config (used by the Dataset, not nnU-Net itself,
 # if you train your custom V-Net instead of nnU-Net proper)
-patch_size: [128, 128, 128]
+patch_size: [256, 256, 256]
 target_spacing: [1.0, 1.0, 1.0]   # resample all volumes to this spacing before patching

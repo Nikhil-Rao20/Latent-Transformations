@@ -98,3 +98,37 @@ patient_split:
 ```
 
 ---
+
+### Labels Mapping
+
+- Myocardium 2D Task:
+
+```
+0: 0,   # background
+500: 1,   # LV
+200: 2,   # Myo
+2221: 3,   # Scar
+```
+
+- Whole Heart 3D Task:
+
+```
+0: 0,      # background
+500: 1,    # LV
+600: 2,    # RV
+420: 3,    # LA
+550: 4,    # RA
+205: 5,    # Myo
+820: 6,    # AO
+850: 7,    # PA
+```
+
+---
+
+## Data Analysis
+
+### Myocardium 2D data
+
+- The image dimension distributions are Below 200: 22, Near to 250: 1568, Above 250: 174, images are there. And majority of them are 256, so lets just resize them to 256 using interpolate.
+- Currently the image data statistics, is standardized normal distribution with mean~0 and std=1. The min~0.7 and max~4.0. We need to normalize them to [0,1]
+- The labels are good, each mapped according to the labels dictionary that we have. 

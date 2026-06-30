@@ -97,6 +97,14 @@ class Myo2DDataset(Dataset):
         image = np.load(row["image_npy"])   # (H, W) float32, already normalized
         label = np.load(row["label_npy"])   # (H, W) uint8, already remapped
 
+        # scale to [0, 1] per image
+        img_min = image.min()
+        img_max = image.max()
+        if img_max > img_min:
+            image = (image - img_min) / (img_max - img_min)
+        else:
+            image = np.zeros_like(image, dtype=np.float32)
+
         image = torch.from_numpy(image).unsqueeze(0).float()   # (1, H, W)
         label = torch.from_numpy(label).long()                  # (H, W)
 
