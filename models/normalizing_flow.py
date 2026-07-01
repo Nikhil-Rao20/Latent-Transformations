@@ -83,7 +83,7 @@ class CyLNormalizingFlow(nn.Module):
         else:
             # Inverse pass (Optional): warp Source Latent back into Target Latent
             for layer in reversed(self.layers):
-                x = torch.flip(x, dims=[1])
                 x = layer(x, reverse=True)
+                x = torch.flip(x, dims=[1])
                 
         return x

@@ -27,6 +27,7 @@ import csv
 import yaml
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
@@ -97,21 +98,12 @@ class Myo2DDataset(Dataset):
         image = np.load(row["image_npy"])   # (H, W) float32, already normalized
         label = np.load(row["label_npy"])   # (H, W) uint8, already remapped
 
-        # scale to [0, 1] per image
-        img_min = image.min()
-        img_max = image.max()
-        if img_max > img_min:
-            image = (image - img_min) / (img_max - img_min)
-        else:
-            image = np.zeros_like(image, dtype=np.float32)
-
         image = torch.from_numpy(image).unsqueeze(0).float()   # (1, H, W)
         label = torch.from_numpy(label).long()                 # (H, W)
 
         # Resize to 256x256
-        import torch.nn.functional as F
         image = F.interpolate(image.unsqueeze(0), size=(256, 256), mode='bilinear', align_corners=False).squeeze(0)
-        label = F.interpolate(label.unsqueeze(0).unsqueeze(0).float(), size=(256, 256), mode='nearest').squeeze(0).squeeze(0).long()
+        label = F.interpolate(label.unsqueeze(0).unsqueeze(0).float(), size=(256, 256), mode='nearest-exact').squeeze(0).squeeze(0).long()
 
         if self.transform is not None:
             image, label = self.transform(image, label)

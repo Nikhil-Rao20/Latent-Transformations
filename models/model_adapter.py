@@ -9,7 +9,7 @@ class CyLAdapterModel(nn.Module):
     and injects a Dynamic Normalizing Flow at the bottleneck to align Target latent 
     representations with the Source domain.
     """
-    def __init__(self, foundation_model, dim=2, bottleneck_channels=512, num_flow_layers=3):
+    def __init__(self, foundation_model, dim=2, num_flow_layers=3):
         super().__init__()
         
         self.foundation = foundation_model
@@ -20,7 +20,7 @@ class CyLAdapterModel(nn.Module):
         self.foundation.eval() # Ensure BatchNorms don't update running stats
             
         # Initialize the dynamic Forward Flow engine
-        self.T_flow = CyLNormalizingFlow(dim=dim, channels=bottleneck_channels, num_layers=num_flow_layers)
+        self.T_flow = CyLNormalizingFlow(dim=dim, channels=self.foundation.bottleneck_channels, num_layers=num_flow_layers)
         
     def forward_foundation(self, x):
         """

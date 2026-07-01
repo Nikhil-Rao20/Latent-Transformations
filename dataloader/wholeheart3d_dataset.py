@@ -117,6 +117,7 @@ class WholeHeart3DDataset(Dataset):
             img = np.clip(img, p1, p99)
             mean, std = img.mean(), img.std()
             img = (img - mean) / (std + 1e-6)
+            img = np.clip(img, -3.0, 3.0)
 
         img = img.astype(np.float32)
         lbl = lbl.astype(np.uint8)

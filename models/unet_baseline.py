@@ -37,7 +37,6 @@ class UNetBaseline(nn.Module):
         self.num_stages = num_stages
         
         self.encoder = nn.ModuleList()
-        self.pool = nn.MaxPool2d(2) if dim == 2 else nn.MaxPool3d(2)
         
         self.decoder = nn.ModuleList()
         self.upsamples = nn.ModuleList()
@@ -73,10 +72,12 @@ class UNetBaseline(nn.Module):
         """
         skips = []
         out = x
+        import torch.nn.functional as F
         for i in range(self.num_stages - 1):
             out = self.encoder[i](out)
             skips.append(out)
-            out = self.pool(out)
+            pool_fn = F.max_pool2d if self.dim == 2 else F.max_pool3d
+            out = pool_fn(out, kernel_size=2)
             
         z = self.encoder[-1](out) # Bottleneck Latent Space
         return skips, z

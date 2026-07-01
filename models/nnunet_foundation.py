@@ -52,6 +52,7 @@ class NNUNetFoundation(nn.Module):
     def __init__(self, dim=2, in_channels=1, num_classes=4, base_filters=32, num_stages=5):
         super().__init__()
         self.dim = dim
+        self.base_filters = base_filters
         self.num_stages = num_stages
         
         self.encoder = nn.ModuleList()
@@ -122,6 +123,10 @@ class NNUNetFoundation(nn.Module):
         skips, z = self.encode(x)
         logits, _ = self.decode(skips, z)
         return logits
+        
+    @property
+    def bottleneck_channels(self):
+        return self.base_filters * (2 ** (self.num_stages - 1))
 
 
 def get_nnunet_model(dim, in_channels, num_classes, pretrained_path=None, device="cuda:0"):
