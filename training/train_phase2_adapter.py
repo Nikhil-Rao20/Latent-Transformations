@@ -1,0 +1,540 @@
+"""
+train_phase2_adapter.py
+=======================
+Phase 2 Training: CyL-Adapter (Normalizing Flow) on Target Domain Data.
+
+The Foundation Model is FULLY FROZEN. Only the CyL-Adapter (T_flow) is
+trained. The adapter learns to warp the target domain bottleneck
+(Z_target) into alignment with the source domain bottleneck (Z_source),
+guided by:
+
+    L_total = L_seg  (Dice + CE on segmentation output)
+            + λ_align * L_align  (MSE between Z_aligned and per-class centroids)
+
+L_align uses the pre-computed per-class centroids from Phase 1
+(centroid_cache.npz). This is the key signal that pulls the target
+latent distribution toward the source distribution.
+
+What this script expects:
+  - A trained Phase 1 checkpoint (best_model.pth)
+  - The centroid_cache.npz from the same Phase 1 run
+  - A target domain dataset (uses the "test" split of the config, which
+    IS the target domain — we train the adapter on a SMALL PORTION of
+    target data in a one-shot or few-shot manner)
+
+One-shot vs few-shot:
+  Set --adapter_train_cases to limit how many target cases the adapter
+  sees during Phase 2. Default is 1 (true one-shot). Set to -1 to use
+  all available target cases (upper bound).
+
+Saves per run (under outputs/<exp_name>_<timestamp>/):
+  - best_adapter.pth    : best val Dice checkpoint (adapter weights only)
+  - last_adapter.pth    : end-of-training adapter weights
+  - adapter_log.csv     : per-epoch metrics
+  - config_used.yaml    : experiment config copy
+
+Usage:
+    python training/train_phase2_adapter.py \
+        --mode 2d \
+        --slices_csv data/metadata_myo2d_slices.csv \
+        --config configs/2d/exp_a1_lge_intercenter.yaml \
+        --foundation_ckpt outputs/phase1_exp_a1_LGE_ABC_.../best_model.pth \
+        --centroid_cache outputs/phase1_exp_a1_LGE_ABC_.../centroid_cache.npz \
+        --output_dir outputs/ \
+        --adapter_train_cases 1 \
+        --epochs 100 \
+        --batch_size 8 \
+        --lr 1e-4 \
+        --lambda_align 0.5 \
+        --device cuda:0
+"""
+
+import argparse
+import csv
+import os
+import random
+import shutil
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+from torch.optim import Adam
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from dataloader.myo2d_dataset import Myo2DDataset
+from dataloader.wholeheart3d_dataset import WholeHeart3DDataset
+from models.nnunet_foundation import NNUNetFoundation
+from models.model_adapter import CyLAdapterModel
+
+
+# ─────────────────────────────────────────────
+# Loss
+# ─────────────────────────────────────────────
+
+class DiceCELoss(nn.Module):
+    def __init__(self, num_classes: int, ce_weight: float = 0.5, smooth: float = 1e-5):
+        super().__init__()
+        self.num_classes = num_classes
+        self.ce_weight = ce_weight
+        self.smooth = smooth
+        self.ce = nn.CrossEntropyLoss()
+
+    def forward(self, logits, targets):
+        ce_loss = self.ce(logits, targets)
+        probs = F.softmax(logits, dim=1)
+        targets_oh = F.one_hot(targets, self.num_classes)
+        dims = [0, targets_oh.dim() - 1] + list(range(1, targets_oh.dim() - 1))
+        targets_oh = targets_oh.permute(*dims).float()
+        probs_flat = probs.view(probs.shape[0], probs.shape[1], -1)
+        tgt_flat   = targets_oh.view(targets_oh.shape[0], targets_oh.shape[1], -1)
+        intersection = (probs_flat * tgt_flat).sum(-1)
+        dice_per_class = (2 * intersection + self.smooth) / \
+                         (probs_flat.sum(-1) + tgt_flat.sum(-1) + self.smooth)
+        dice_loss = 1.0 - dice_per_class.mean()
+        return (1 - self.ce_weight) * dice_loss + self.ce_weight * ce_loss
+
+
+class CentroidAlignmentLoss(nn.Module):
+    """
+    Per-class MSE between the aligned bottleneck and the pre-computed
+    source-domain class centroids.
+
+    For each class c present in the batch:
+        L_align += MSE(mean(Z_aligned[mask_c]), mu_c)
+
+    This pulls the target latent distribution toward the source distribution
+    in a class-discriminative way — preventing the collapse to a single mean.
+    """
+    def __init__(self, centroids: dict, device: torch.device):
+        super().__init__()
+        # centroids: {class_idx: numpy array (C,)}
+        self.centroids = {
+            c: torch.tensor(v, dtype=torch.float32, device=device)
+            for c, v in centroids.items()
+            if v.shape[0] > 1          # skip placeholder zeros
+        }
+
+    def forward(self, z_aligned: torch.Tensor, labels: torch.Tensor):
+        """
+        z_aligned: (B, C, h, w) or (B, C, h, w, d) — bottleneck after flow
+        labels:    (B, H, W) or (B, H, W, D) — full-res label map
+        """
+        # spatially-average the aligned latent to get per-sample (B, C) vectors
+        spatial_dims = list(range(2, z_aligned.dim()))
+        z_vec = z_aligned.mean(dim=spatial_dims)   # (B, C)
+
+        loss = torch.tensor(0.0, device=z_aligned.device)
+        n_classes_seen = 0
+
+        for c, mu_c in self.centroids.items():
+            # which samples in the batch contain class c (anywhere in spatial dims)
+            has_class = (labels == c).view(labels.shape[0], -1).any(dim=1)  # (B,)
+            if not has_class.any():
+                continue
+            z_c    = z_vec[has_class]              # (N_c, C)
+            mean_z = z_c.mean(dim=0)               # (C,)
+            loss   = loss + F.mse_loss(mean_z, mu_c)
+            n_classes_seen += 1
+
+        if n_classes_seen > 0:
+            loss = loss / n_classes_seen
+
+        return loss
+
+
+# ─────────────────────────────────────────────
+# Metrics
+# ─────────────────────────────────────────────
+
+def compute_dice_per_class(preds, targets, num_classes, smooth=1e-5):
+    dice_scores = np.zeros(num_classes, dtype=np.float32)
+    for c in range(num_classes):
+        pred_c = (preds == c).float()
+        tgt_c  = (targets == c).float()
+        intersection = (pred_c * tgt_c).sum().item()
+        union = pred_c.sum().item() + tgt_c.sum().item()
+        dice_scores[c] = (2 * intersection + smooth) / (union + smooth)
+    return dice_scores
+
+
+# ─────────────────────────────────────────────
+# Case-level subset selection (one-shot / few-shot)
+# ─────────────────────────────────────────────
+
+def select_adapter_train_subset(dataset, n_cases: int, seed: int):
+    """
+    Randomly selects n_cases unique case_ids from the dataset (for
+    one-shot / few-shot adapter training). Returns train indices and
+    val indices (remaining cases).
+    """
+    if n_cases == -1:
+        # use all cases for training, no val subset
+        return list(range(len(dataset))), []
+
+    # gather all case_ids with their indices
+    case_to_indices: dict = {}
+    for i, row in enumerate(dataset.rows):
+        cid = row.get("case_id", f"vol_{i}")
+        case_to_indices.setdefault(cid, []).append(i)
+
+    all_cases = sorted(case_to_indices.keys())
+    rng = random.Random(seed)
+    rng.shuffle(all_cases)
+
+    n_cases = min(n_cases, len(all_cases))
+    train_cases = set(all_cases[:n_cases])
+    val_cases   = set(all_cases[n_cases:])
+
+    train_idx = [i for c in train_cases for i in case_to_indices[c]]
+    val_idx   = [i for c in val_cases   for i in case_to_indices[c]]
+
+    return train_idx, val_idx
+
+
+# ─────────────────────────────────────────────
+# Train / Val loops
+# ─────────────────────────────────────────────
+
+def train_one_epoch(adapter, loader, optimizer, seg_loss_fn,
+                    align_loss_fn, lambda_align, device, num_classes):
+    adapter.train()   # foundation stays in eval via overridden train()
+    total_seg   = 0.0
+    total_align = 0.0
+    total_total = 0.0
+    all_dice    = np.zeros(num_classes, dtype=np.float64)
+    n_batches   = 0
+
+    for batch in loader:
+        images = batch["image"].to(device)
+        labels = batch["label"].to(device)
+
+        optimizer.zero_grad()
+
+        logits, z_target, z_aligned = adapter(images)
+
+        l_seg   = seg_loss_fn(logits, labels)
+        l_align = align_loss_fn(z_aligned, labels)
+        loss    = l_seg + lambda_align * l_align
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(adapter.T_flow.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        preds = logits.argmax(dim=1)
+        dice  = compute_dice_per_class(preds.cpu(), labels.cpu(), num_classes)
+
+        total_seg   += l_seg.item()
+        total_align += l_align.item()
+        total_total += loss.item()
+        all_dice    += dice
+        n_batches   += 1
+
+    return (total_total / n_batches,
+            total_seg   / n_batches,
+            total_align / n_batches,
+            all_dice    / n_batches)
+
+
+@torch.no_grad()
+def validate(adapter, loader, seg_loss_fn, align_loss_fn,
+             lambda_align, device, num_classes):
+    adapter.eval()
+    total_seg   = 0.0
+    total_align = 0.0
+    total_total = 0.0
+    all_dice    = np.zeros(num_classes, dtype=np.float64)
+    n_batches   = 0
+
+    for batch in loader:
+        images = batch["image"].to(device)
+        labels = batch["label"].to(device)
+
+        logits, _, z_aligned = adapter(images)
+
+        l_seg   = seg_loss_fn(logits, labels)
+        l_align = align_loss_fn(z_aligned, labels)
+        loss    = l_seg + lambda_align * l_align
+
+        preds = logits.argmax(dim=1)
+        dice  = compute_dice_per_class(preds.cpu(), labels.cpu(), num_classes)
+
+        total_seg   += l_seg.item()
+        total_align += l_align.item()
+        total_total += loss.item()
+        all_dice    += dice
+        n_batches   += 1
+
+    return (total_total / n_batches,
+            total_seg   / n_batches,
+            total_align / n_batches,
+            all_dice    / n_batches)
+
+
+# ─────────────────────────────────────────────
+# CSV logger
+# ─────────────────────────────────────────────
+
+class CSVLogger:
+    def __init__(self, path, fieldnames):
+        self.path = path
+        self.fieldnames = fieldnames
+        with open(path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+
+    def log(self, row):
+        with open(self.path, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=self.fieldnames).writerow(row)
+
+
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode",              required=True, choices=["2d", "3d"])
+    p.add_argument("--config",            required=True)
+    p.add_argument("--foundation_ckpt",   required=True,
+                   help="Path to best_model.pth from Phase 1")
+    p.add_argument("--centroid_cache",    required=True,
+                   help="Path to centroid_cache.npz from Phase 1")
+    p.add_argument("--output_dir",        default="outputs/")
+
+    # 2D
+    p.add_argument("--slices_csv",        default=None)
+    # 3D
+    p.add_argument("--volumes_csv",       default=None)
+    p.add_argument("--npy_cache_dir",     default=None)
+
+    # Adapter hyperparams
+    p.add_argument("--adapter_train_cases", type=int, default=1,
+                   help="Number of target cases for adapter training. -1 = all.")
+    p.add_argument("--num_flow_layers",   type=int,   default=3)
+    p.add_argument("--epochs",            type=int,   default=100)
+    p.add_argument("--batch_size",        type=int,   default=8)
+    p.add_argument("--lr",                type=float, default=1e-4)
+    p.add_argument("--weight_decay",      type=float, default=1e-5)
+    p.add_argument("--lambda_align",      type=float, default=0.5,
+                   help="Weight for centroid alignment loss")
+    p.add_argument("--num_workers",       type=int,   default=4)
+    p.add_argument("--device",            default="cuda:0")
+    p.add_argument("--seed",              type=int,   default=42)
+
+    # Foundation model architecture (must match Phase 1)
+    p.add_argument("--base_filters",      type=int,   default=32)
+    p.add_argument("--num_stages",        type=int,   default=5)
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    import yaml
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+    exp_name  = cfg["name"]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir   = Path(args.output_dir) / f"phase2_{exp_name}_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy(args.config, run_dir / "config_used.yaml")
+
+    print(f"\n{'='*60}")
+    print(f"  Phase 2 Adapter Training")
+    print(f"  Experiment  : {exp_name}")
+    print(f"  Mode        : {args.mode.upper()}")
+    print(f"  Target cases: {args.adapter_train_cases} (one-shot=1)")
+    print(f"  λ_align     : {args.lambda_align}")
+    print(f"  Output      : {run_dir}")
+    print(f"{'='*60}\n")
+
+    # ── target dataset (the "test" split in the config IS the target domain) ──
+    if args.mode == "2d":
+        assert args.slices_csv
+        target_ds = Myo2DDataset(args.slices_csv, args.config, split="test")
+    else:
+        assert args.volumes_csv and args.npy_cache_dir
+        target_ds = WholeHeart3DDataset(args.volumes_csv, args.config,
+                                        split="test",
+                                        npy_cache_dir=args.npy_cache_dir)
+    target_ds.summary()
+    num_classes = len(target_ds.classes)
+    class_names = target_ds.classes
+
+    # ── one-shot / few-shot case selection ──
+    train_idx, val_idx = select_adapter_train_subset(
+        target_ds, args.adapter_train_cases, args.seed)
+
+    if len(train_idx) == 0:
+        raise RuntimeError("No training samples selected — check --adapter_train_cases")
+
+    train_subset = Subset(target_ds, train_idx)
+    val_subset   = Subset(target_ds, val_idx) if val_idx else None
+
+    train_loader = DataLoader(train_subset, batch_size=args.batch_size,
+                              shuffle=True,  num_workers=args.num_workers,
+                              pin_memory=True, drop_last=len(train_subset) > args.batch_size)
+    val_loader   = DataLoader(val_subset,   batch_size=args.batch_size,
+                              shuffle=False, num_workers=args.num_workers,
+                              pin_memory=True) if val_subset else None
+
+    print(f"  Adapter train slices/volumes : {len(train_subset)}")
+    print(f"  Adapter val   slices/volumes : {len(val_subset) if val_subset else 0}\n")
+
+    # ── load foundation model ──
+    dim = 2 if args.mode == "2d" else 3
+    foundation = NNUNetFoundation(
+        dim=dim, in_channels=1, num_classes=num_classes,
+        base_filters=args.base_filters, num_stages=args.num_stages
+    )
+    ckpt = torch.load(args.foundation_ckpt, map_location="cpu")
+    foundation.load_state_dict(ckpt["model_state"])
+    print(f"  Loaded foundation from: {args.foundation_ckpt}")
+    print(f"  (Phase 1 best val Dice: {ckpt.get('val_dice', 'N/A')})")
+
+    # bottleneck channels = base_filters * 2^(num_stages-1)
+    bottleneck_ch = args.base_filters * (2 ** (args.num_stages - 1))
+    print(f"  Bottleneck channels : {bottleneck_ch}")
+
+    adapter = CyLAdapterModel(
+        foundation_model=foundation,
+        dim=dim,
+        bottleneck_channels=bottleneck_ch,
+        num_flow_layers=args.num_flow_layers,
+    ).to(device)
+
+    n_flow_params = sum(p.numel() for p in adapter.T_flow.parameters())
+    print(f"  Flow params (trainable): {n_flow_params:,}\n")
+
+    # ── load centroids ──
+    centroid_data = np.load(args.centroid_cache)
+    centroids = {
+        int(k.replace("class_", "")): centroid_data[k]
+        for k in centroid_data.files
+    }
+    print(f"  Loaded {len(centroids)} class centroids from: {args.centroid_cache}")
+
+    # ── losses ──
+    seg_loss_fn   = DiceCELoss(num_classes=num_classes)
+    align_loss_fn = CentroidAlignmentLoss(centroids, device)
+
+    # ── optimiser — ONLY flow params ──
+    optimizer = Adam(adapter.T_flow.parameters(), lr=args.lr,
+                     weight_decay=args.weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+
+    # ── CSV logger ──
+    fieldnames = (
+        ["epoch", "phase", "loss_total", "loss_seg", "loss_align",
+         "mean_dice", "lr", "epoch_time_s"]
+        + [f"dice_{c}" for c in class_names]
+    )
+    logger = CSVLogger(run_dir / "adapter_log.csv", fieldnames)
+
+    # save args
+    with open(run_dir / "train_args.yaml", "w") as f:
+        yaml.dump(vars(args), f)
+
+    # ── training loop ──
+    best_val_dice  = -1.0
+    best_epoch     = 0
+    has_val        = val_loader is not None
+
+    for epoch in range(1, args.epochs + 1):
+        t0 = time.time()
+
+        (tr_loss, tr_seg, tr_align,
+         tr_dice) = train_one_epoch(
+            adapter, train_loader, optimizer,
+            seg_loss_fn, align_loss_fn, args.lambda_align,
+            device, num_classes)
+
+        if has_val:
+            (vl_loss, vl_seg, vl_align,
+             vl_dice) = validate(
+                adapter, val_loader,
+                seg_loss_fn, align_loss_fn, args.lambda_align,
+                device, num_classes)
+            monitor_dice = float(np.mean(vl_dice[1:]))
+        else:
+            # no val cases (pure one-shot with only 1 case total):
+            # monitor training dice instead
+            vl_loss = vl_seg = vl_align = tr_loss
+            vl_dice = tr_dice
+            monitor_dice = float(np.mean(tr_dice[1:]))
+
+        scheduler.step()
+        epoch_time = time.time() - t0
+        current_lr = scheduler.get_last_lr()[0]
+
+        # ── log ──
+        for phase, loss, seg, align, dice in [
+            ("train", tr_loss, tr_seg, tr_align, tr_dice),
+            ("val",   vl_loss, vl_seg, vl_align, vl_dice),
+        ]:
+            row = {
+                "epoch":        epoch,
+                "phase":        phase,
+                "loss_total":   round(loss,  6),
+                "loss_seg":     round(seg,   6),
+                "loss_align":   round(align, 6),
+                "mean_dice":    round(float(np.mean(dice[1:])), 6),
+                "lr":           round(current_lr, 8),
+                "epoch_time_s": round(epoch_time, 2),
+            }
+            for i, cname in enumerate(class_names):
+                row[f"dice_{cname}"] = round(float(dice[i]), 6)
+            logger.log(row)
+
+        # ── checkpoint: last ──
+        torch.save({
+            "epoch":            epoch,
+            "flow_state":       adapter.T_flow.state_dict(),
+            "foundation_ckpt":  args.foundation_ckpt,
+            "val_dice":         monitor_dice,
+            "config":           cfg,
+            "args":             vars(args),
+        }, run_dir / "last_adapter.pth")
+
+        # ── checkpoint: best ──
+        if monitor_dice > best_val_dice:
+            best_val_dice = monitor_dice
+            best_epoch    = epoch
+            torch.save({
+                "epoch":            epoch,
+                "flow_state":       adapter.T_flow.state_dict(),
+                "foundation_ckpt":  args.foundation_ckpt,
+                "val_dice":         monitor_dice,
+                "config":           cfg,
+                "args":             vars(args),
+            }, run_dir / "best_adapter.pth")
+
+        # ── console ──
+        if epoch % 10 == 0 or epoch == 1:
+            tr_mean = float(np.mean(tr_dice[1:]))
+            dice_str = "  ".join(
+                f"{c}:{d:.3f}" for c, d in zip(class_names[1:], vl_dice[1:]))
+            print(f"[{epoch:>4d}/{args.epochs}] "
+                  f"tr_loss={tr_loss:.4f}  vl_loss={vl_loss:.4f}  "
+                  f"tr_dice={tr_mean:.4f}  vl_dice={monitor_dice:.4f}  "
+                  f"align={tr_align:.4f}  [{dice_str}]  "
+                  f"lr={current_lr:.6f}  t={epoch_time:.1f}s")
+
+    print(f"\n  Best adapter val Dice : {best_val_dice:.4f} at epoch {best_epoch}")
+    print(f"  All outputs saved to  : {run_dir}\n")
+
+
+if __name__ == "__main__":
+    main()
