@@ -71,8 +71,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dataloader.myo2d_dataset import Myo2DDataset
 from dataloader.wholeheart3d_dataset import WholeHeart3DDataset
-from models.nnunet_foundation import NNUNetFoundation
 from models.model_adapter import CyLAdapterModel
+
+# Models Importing
+from models.nnunet_foundation import NNUNetFoundation
+from models.unet_baseline import UNetBaseline
+MODEL_REGISTRY = {
+    "nnunet": NNUNetFoundation,
+    "unet":   UNetBaseline,
+}
 
 
 # ─────────────────────────────────────────────
@@ -278,6 +285,26 @@ def validate(adapter, loader, seg_loss_fn, align_loss_fn,
             all_dice    / n_batches)
 
 
+@torch.no_grad()
+def validate_foundation(model, loader, criterion, device, num_classes):
+    """Direct evaluation of frozen foundation with no adapter — for ablation."""
+    model.eval()
+    total_loss = 0.0
+    all_dice   = np.zeros(num_classes, dtype=np.float64)
+    n_batches  = 0
+    for batch in loader:
+        images = batch["image"].to(device)
+        labels = batch["label"].to(device)
+        logits = model(images)
+        loss   = criterion(logits, labels)
+        preds  = logits.argmax(dim=1)
+        dice   = compute_dice_per_class(preds.cpu(), labels.cpu(), num_classes)
+        total_loss += loss.item()
+        all_dice   += dice
+        n_batches  += 1
+    return total_loss / n_batches, all_dice / n_batches
+
+
 # ─────────────────────────────────────────────
 # CSV logger
 # ─────────────────────────────────────────────
@@ -314,6 +341,10 @@ def parse_args():
     p.add_argument("--volumes_csv",       default=None)
     p.add_argument("--npy_cache_dir",     default=None)
 
+    # Model Selection
+    p.add_argument("--model", default="nnunet", choices=list(MODEL_REGISTRY.keys()), help="Must match the model used in Phase 1")
+    p.add_argument("--no_adapter", action="store_true", help="Run frozen foundation only, no flow adapter (ablation baseline)")
+
     # Adapter hyperparams
     p.add_argument("--adapter_train_cases", type=int, default=1,
                    help="Number of target cases for adapter training. -1 = all.")
@@ -347,7 +378,8 @@ def main():
         cfg = yaml.safe_load(f)
     exp_name  = cfg["name"]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir   = Path(args.output_dir) / f"phase2_{exp_name}_{timestamp}"
+    run_dir_suffix = "no_adapter" if args.no_adapter else "adapter"
+    run_dir = Path(args.output_dir) / f"phase2_{args.model}_{run_dir_suffix}_{exp_name}_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy(args.config, run_dir / "config_used.yaml")
 
@@ -394,15 +426,108 @@ def main():
     print(f"  Adapter val   slices/volumes : {len(val_subset) if val_subset else 0}\n")
 
     # ── load foundation model ──
+
+    # validate model choice
+    if args.model not in MODEL_REGISTRY:
+        raise ValueError(f"Unknown model '{args.model}'. Available: {list(MODEL_REGISTRY.keys())}")
+
+    # validate checkpoint path
+    if not os.path.exists(args.foundation_ckpt):
+        raise FileNotFoundError(
+            f"Foundation checkpoint not found: {args.foundation_ckpt}\n"
+            f"Run Phase 1 first with --model {args.model}"
+        )
+
+    # load and verify the checkpoint was trained with the same model
+    ckpt = torch.load(args.foundation_ckpt, map_location="cpu")
+    ckpt_model = ckpt.get("args", {}).get("model", "unknown")
+    if ckpt_model != "unknown" and ckpt_model != args.model:
+        raise ValueError(
+            f"Model mismatch: checkpoint was trained with '{ckpt_model}' "
+            f"but --model is '{args.model}'. Use the correct --model flag."
+        )
     dim = 2 if args.mode == "2d" else 3
-    foundation = NNUNetFoundation(
+    model_cls = MODEL_REGISTRY[args.model]
+    foundation = model_cls(
         dim=dim, in_channels=1, num_classes=num_classes,
         base_filters=args.base_filters, num_stages=args.num_stages
     )
-    ckpt = torch.load(args.foundation_ckpt, map_location="cpu")
-    foundation.load_state_dict(ckpt["model_state"])
-    print(f"  Loaded foundation from: {args.foundation_ckpt}")
-    print(f"  (Phase 1 best val Dice: {ckpt.get('val_dice', 'N/A')})")
+
+    try:
+        foundation.load_state_dict(ckpt["model_state"])
+        print(f"  Loaded {args.model} foundation from: {args.foundation_ckpt}")
+        print(f"  Phase 1 best val Dice: {ckpt.get('val_dice', 'N/A')}")
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Failed to load weights into {args.model} — architecture mismatch.\n"
+            f"Check --base_filters and --num_stages match Phase 1 settings.\n"
+            f"Original error: {e}"
+        )
+
+    if args.no_adapter:
+        print("  Mode: NO ADAPTER (frozen foundation only — ablation baseline)")
+        foundation = foundation.to(device)
+        for param in foundation.parameters():
+            param.requires_grad = False
+        foundation.eval()
+
+        seg_loss_fn = DiceCELoss(num_classes=num_classes)
+
+        eval_rows = []
+        train_loss, train_dice = validate_foundation(
+            foundation, train_loader, seg_loss_fn, device, num_classes
+        )
+        eval_rows.append(("train", train_loss, train_dice))
+
+        if val_loader is not None:
+            val_loss, val_dice = validate_foundation(
+                foundation, val_loader, seg_loss_fn, device, num_classes
+            )
+            eval_rows.append(("val", val_loss, val_dice))
+        else:
+            val_loss, val_dice = train_loss, train_dice
+
+        fieldnames = (
+            ["epoch", "phase", "loss_total", "loss_seg", "loss_align",
+             "mean_dice", "lr", "epoch_time_s"]
+            + [f"dice_{c}" for c in class_names]
+        )
+        logger = CSVLogger(run_dir / "no_adapter_log.csv", fieldnames)
+
+        for phase, loss, dice in eval_rows:
+            row = {
+                "epoch": 0,
+                "phase": phase,
+                "loss_total": round(float(loss), 6),
+                "loss_seg": round(float(loss), 6),
+                "loss_align": 0.0,
+                "mean_dice": round(float(np.mean(dice[1:])), 6),
+                "lr": 0.0,
+                "epoch_time_s": 0.0,
+            }
+            for i, cname in enumerate(class_names):
+                row[f"dice_{cname}"] = round(float(dice[i]), 6)
+            logger.log(row)
+
+        summary = {
+            "mode": args.mode,
+            "model": args.model,
+            "no_adapter": True,
+            "foundation_ckpt": args.foundation_ckpt,
+            "train_loss": float(train_loss),
+            "train_mean_dice": float(np.mean(train_dice[1:])),
+            "val_loss": float(val_loss),
+            "val_mean_dice": float(np.mean(val_dice[1:])),
+            "config": cfg,
+            "args": vars(args),
+        }
+        with open(run_dir / "no_adapter_summary.yaml", "w") as f:
+            yaml.dump(summary, f)
+
+        print(f"  Frozen foundation train Dice : {float(np.mean(train_dice[1:])):.4f}")
+        print(f"  Frozen foundation val   Dice : {float(np.mean(val_dice[1:])):.4f}")
+        print(f"  All outputs saved to        : {run_dir}\n")
+        return
 
     # bottleneck channels = base_filters * 2^(num_stages-1)
     bottleneck_ch = args.base_filters * (2 ** (args.num_stages - 1))
@@ -411,7 +536,7 @@ def main():
     adapter = CyLAdapterModel(
         foundation_model=foundation,
         dim=dim,
-        bottleneck_channels=bottleneck_ch,
+        # bottleneck_channels=bottleneck_ch,
         num_flow_layers=args.num_flow_layers,
     ).to(device)
 

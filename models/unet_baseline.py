@@ -45,6 +45,7 @@ class UNetBaseline(nn.Module):
         # ENCODER
         # ---------------------
         filters = base_filters
+        self.base_filters = base_filters
         self.encoder.append(UNetConvBlock(dim, in_channels, filters))
         
         for i in range(num_stages - 1):
@@ -111,6 +112,10 @@ class UNetBaseline(nn.Module):
         skips, z = self.encode(x)
         logits, _ = self.decode(skips, z)
         return logits
+
+    @property
+    def bottleneck_channels(self):
+        return self.base_filters * (2 ** (self.num_stages - 1))
 
 
 def get_unet_baseline(dim, in_channels, num_classes, pretrained_path=None, device="cuda:0"):

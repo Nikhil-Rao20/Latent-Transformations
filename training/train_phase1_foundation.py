@@ -67,8 +67,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dataloader.myo2d_dataset import Myo2DDataset
 from dataloader.wholeheart3d_dataset import WholeHeart3DDataset
-from models.nnunet_foundation import NNUNetFoundation
 
+# All models import
+from models.nnunet_foundation import NNUNetFoundation
+from models.unet_baseline import UNetBaseline
+
+MODEL_REGISTRY = {
+    "nnunet": NNUNetFoundation,
+    "unet":   UNetBaseline,
+}
 
 # ─────────────────────────────────────────────
 # Loss
@@ -264,6 +271,9 @@ def parse_args():
     p.add_argument("--volumes_csv",  default=None, help="metadata_wholeheart3d.csv")
     p.add_argument("--npy_cache_dir",default=None, help="3D npy cache directory")
 
+    # Model Selection 
+    p.add_argument("--model", default="nnunet", choices=["nnunet", "unet"], help="Foundation model architecture to train")
+
     # Training hyperparams
     p.add_argument("--epochs",       type=int,   default=200)
     p.add_argument("--batch_size",   type=int,   default=16)
@@ -296,7 +306,7 @@ def main():
         cfg = yaml.safe_load(f)
     exp_name  = cfg["name"]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir   = Path(args.output_dir) / f"phase1_{exp_name}_{timestamp}"
+    run_dir   = Path(args.output_dir) / f"phase1_{args.model}_{exp_name}_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy(args.config, run_dir / "config_used.yaml")
     print(f"\n{'='*60}")
@@ -340,7 +350,9 @@ def main():
 
     # ── model ──
     dim = 2 if args.mode == "2d" else 3
-    model = NNUNetFoundation(
+
+    model_cls = MODEL_REGISTRY[args.model]
+    model = model_cls(
         dim=dim,
         in_channels=1,
         num_classes=num_classes,
