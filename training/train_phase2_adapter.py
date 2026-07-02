@@ -109,52 +109,34 @@ class DiceCELoss(nn.Module):
         return (1 - self.ce_weight) * dice_loss + self.ce_weight * ce_loss
 
 
-class CentroidAlignmentLoss(nn.Module):
+class GlobalAlignmentLoss(nn.Module):
     """
-    Per-class MSE between the aligned bottleneck and the pre-computed
-    source-domain class centroids.
-
-    For each class c present in the batch:
-        L_align += MSE(mean(Z_aligned[mask_c]), mu_c)
-
-    This pulls the target latent distribution toward the source distribution
-    in a class-discriminative way — preventing the collapse to a single mean.
+    Combined alignment loss (MSE + L1 + Cosine) between the aligned bottleneck 
+    and the single global source-domain centroid.
     """
-    def __init__(self, centroids: dict, device: torch.device):
+    def __init__(self, global_centroid: np.ndarray, device: torch.device):
         super().__init__()
-        # centroids: {class_idx: numpy array (C,)}
-        self.centroids = {
-            c: torch.tensor(v, dtype=torch.float32, device=device)
-            for c, v in centroids.items()
-            if v.shape[0] > 1          # skip placeholder zeros
-        }
+        self.centroid = torch.tensor(global_centroid, dtype=torch.float32, device=device)
+        self.mse = nn.MSELoss()
+        self.l1 = nn.L1Loss()
 
-    def forward(self, z_aligned: torch.Tensor, labels: torch.Tensor):
+    def forward(self, z_aligned: torch.Tensor, labels=None):
         """
-        z_aligned: (B, C, h, w) or (B, C, h, w, d) — bottleneck after flow
-        labels:    (B, H, W) or (B, H, W, D) — full-res label map
+        z_aligned: (B, C, h, w) or (B, C, h, w, d)
+        labels: ignored (kept for API compatibility with old loops)
         """
-        # spatially-average the aligned latent to get per-sample (B, C) vectors
+        # Spatially average to get (B, C)
         spatial_dims = list(range(2, z_aligned.dim()))
-        z_vec = z_aligned.mean(dim=spatial_dims)   # (B, C)
+        z_vec = z_aligned.mean(dim=spatial_dims)
 
-        loss = torch.tensor(0.0, device=z_aligned.device)
-        n_classes_seen = 0
+        # Expand centroid to batch size: (B, C)
+        c_batch = self.centroid.unsqueeze(0).expand(z_vec.size(0), -1)
 
-        for c, mu_c in self.centroids.items():
-            # which samples in the batch contain class c (anywhere in spatial dims)
-            has_class = (labels == c).view(labels.shape[0], -1).any(dim=1)  # (B,)
-            if not has_class.any():
-                continue
-            z_c    = z_vec[has_class]              # (N_c, C)
-            mean_z = z_c.mean(dim=0)               # (C,)
-            loss   = loss + F.mse_loss(mean_z, mu_c)
-            n_classes_seen += 1
+        loss_mse = self.mse(z_vec, c_batch)
+        loss_l1  = self.l1(z_vec, c_batch)
+        loss_cos = 1.0 - F.cosine_similarity(z_vec, c_batch, dim=1).mean()
 
-        if n_classes_seen > 0:
-            loss = loss / n_classes_seen
-
-        return loss
+        return loss_mse + loss_l1 + loss_cos
 
 
 # ─────────────────────────────────────────────
@@ -331,8 +313,8 @@ def parse_args():
     p.add_argument("--config",            required=True)
     p.add_argument("--foundation_ckpt",   required=True,
                    help="Path to best_model.pth from Phase 1")
-    p.add_argument("--centroid_cache",    required=True,
-                   help="Path to centroid_cache.npz from Phase 1")
+    p.add_argument("--centroid_cache",    default=None,
+                   help="Path to global_centroid.npy from Phase 1. If not provided, pure task loss is used.")
     p.add_argument("--output_dir",        default="outputs/")
 
     # 2D
@@ -543,17 +525,17 @@ def main():
     n_flow_params = sum(p.numel() for p in adapter.T_flow.parameters())
     print(f"  Flow params (trainable): {n_flow_params:,}\n")
 
-    # ── load centroids ──
-    centroid_data = np.load(args.centroid_cache)
-    centroids = {
-        int(k.replace("class_", "")): centroid_data[k]
-        for k in centroid_data.files
-    }
-    print(f"  Loaded {len(centroids)} class centroids from: {args.centroid_cache}")
-
-    # ── losses ──
-    seg_loss_fn   = DiceCELoss(num_classes=num_classes)
-    align_loss_fn = CentroidAlignmentLoss(centroids, device)
+    # ── load centroids and setup loss ──
+    seg_loss_fn = DiceCELoss(num_classes=num_classes)
+    
+    if args.centroid_cache and os.path.exists(args.centroid_cache):
+        centroid_data = np.load(args.centroid_cache)
+        print(f"  Loaded global centroid from: {args.centroid_cache}")
+        align_loss_fn = GlobalAlignmentLoss(centroid_data, device)
+    else:
+        print("  No centroid provided. Using PURE task loss (lambda_align = 0.0)")
+        args.lambda_align = 0.0
+        align_loss_fn = lambda z, y: torch.tensor(0.0, device=device)
 
     # ── optimiser — ONLY flow params ──
     optimizer = Adam(adapter.T_flow.parameters(), lr=args.lr,

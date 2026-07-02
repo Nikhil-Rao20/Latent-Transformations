@@ -134,8 +134,3 @@ patient_split:
 - The labels are good, each mapped according to the labels dictionary that we have. 
 
 ---
-okay leave that, i have done it, and please tell me in short, that we are doing the phase 2 on? like for the given image we are making the latent space near to the training data latent space, or why those class wise centroid? are there ? because my doubt is that when say an point has both the two classes, which it will map to it then, the previous idea was to match the training image latent space simple, but here we are doing class wise dont understand the thing? because i am able to see that the phase 2 training is actually decreasing the dice score, and not increasing in epoch1 of phase it is around 0.3 and in the last epoch it comes to 0.0, in the previous dataset that i did way back was with the image latent space only, not per class, at that time i got around 0.72 dice score on LGE when trained using cine, just saying to you. Can you please tell me, or shall we sift back to the training image latent space rather than the per-class latent space (centroid)?
-
-
-
-so this is my question, and will you answer now or shall i give you the first training report of the phase1 and phase2, then you will answer this or after the testing you will answer this? choose one and do the things accordingly

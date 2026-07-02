@@ -141,47 +141,32 @@ def compute_dice_per_class(preds: torch.Tensor, targets: torch.Tensor,
 # ─────────────────────────────────────────────
 
 @torch.no_grad()
-def compute_class_centroids(model: NNUNetFoundation, loader: DataLoader,
-                            num_classes: int, device: torch.device):
+def compute_global_centroid(model, loader, device):
     """
     Forward-passes all training samples through the frozen encoder,
-    accumulates per-class mean bottleneck feature vectors.
-    Returns dict: {class_idx: mean_tensor}  (saved to centroid_cache.npz)
+    accumulates a SINGLE global mean bottleneck feature vector.
     """
     model.eval()
-    sum_by_class   = {c: None for c in range(num_classes)}
-    count_by_class = {c: 0    for c in range(num_classes)}
+    sum_z = None
+    count_z = 0
 
     for batch in loader:
         images  = batch["image"].to(device)
-        labels  = batch["label"].to(device)        # (B, H, W) or (B, H, W, D)
         _, z    = model.encode(images)             # z: (B, C, h, w) or (B, C, h, w, d)
 
-        for c in range(num_classes):
-            # mask: (B,) — which items in the batch have this class
-            mask = (labels == c).any(dim=list(range(1, labels.dim()))).cpu()
-            if not mask.any():
-                continue
-            z_subset = z[mask].detach().cpu()     # (N_c, C, h, w)
-            # spatial-average to get (N_c, C)
-            z_vec = z_subset.mean(dim=list(range(2, z_subset.dim())))
-            batch_mean = z_vec.mean(dim=0)        # (C,)
+        # Spatial average to get (B, C)
+        z_vec = z.mean(dim=list(range(2, z.dim())))
+        
+        batch_sum = z_vec.sum(dim=0).cpu()         # (C,)
 
-            if sum_by_class[c] is None:
-                sum_by_class[c] = batch_mean * mask.sum().item()
-            else:
-                sum_by_class[c] += batch_mean * mask.sum().item()
-            count_by_class[c] += mask.sum().item()
-
-    centroids = {}
-    for c in range(num_classes):
-        if count_by_class[c] > 0:
-            centroids[c] = (sum_by_class[c] / count_by_class[c]).numpy()
+        if sum_z is None:
+            sum_z = batch_sum
         else:
-            print(f"  WARNING: class {c} never appeared in training set — centroid is zeros")
-            centroids[c] = np.zeros(1)  # placeholder
+            sum_z += batch_sum
+            
+        count_z += z_vec.size(0)
 
-    return centroids
+    return (sum_z / count_z).numpy()
 
 
 # ─────────────────────────────────────────────
@@ -273,6 +258,10 @@ def parse_args():
 
     # Model Selection 
     p.add_argument("--model", default="nnunet", choices=["nnunet", "unet"], help="Foundation model architecture to train")
+
+    # Centroid extraction only mode
+    p.add_argument("--extract_centroid_only", action="store_true", help="Skip training, just load checkpoint and extract global centroid")
+    p.add_argument("--checkpoint_path", default=None, help="Path to best_model.pth (required if --extract_centroid_only)")
 
     # Training hyperparams
     p.add_argument("--epochs",       type=int,   default=200)
@@ -368,6 +357,22 @@ def main():
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     criterion = DiceCELoss(num_classes=num_classes)
 
+    # ── early exit for centroid extraction ──
+    if args.extract_centroid_only:
+        assert args.checkpoint_path, "--checkpoint_path is required with --extract_centroid_only"
+        print(f"\n  [Centroid Extraction Mode] Skipping training. Loading from: {args.checkpoint_path}")
+        ckpt = torch.load(args.checkpoint_path, map_location="cpu")
+        model.load_state_dict(ckpt["model_state"])
+        model.to(device)
+        
+        centroid_loader = DataLoader(full_ds, batch_size=args.batch_size, shuffle=False,
+                                     num_workers=args.num_workers, pin_memory=True)
+        global_cent = compute_global_centroid(model, centroid_loader, device)
+        save_dir = Path(args.checkpoint_path).parent
+        np.save(save_dir / "global_centroid.npy", global_cent)
+        print(f"  Global centroid saved to: {save_dir / 'global_centroid.npy'} (norm={np.linalg.norm(global_cent):.4f})\n")
+        return
+
     # ── CSV logger ──
     class_names = full_ds.classes
     fieldnames  = (
@@ -446,8 +451,8 @@ def main():
     print(f"\n  Best val Dice: {best_val_dice:.4f} at epoch {best_epoch}")
     print(f"  Models saved to: {run_dir}")
 
-    # ── compute & save per-class centroids ──
-    print("\n  Computing per-class bottleneck centroids (for Phase 2)...")
+    # ── compute & save global centroid ──
+    print("\n  Computing global bottleneck centroid (for Phase 2)...")
     best_ckpt = torch.load(run_dir / "best_model.pth", map_location="cpu")
     model.load_state_dict(best_ckpt["model_state"])
     model.to(device)
@@ -455,15 +460,11 @@ def main():
     # use the full training set (no val split) for centroid computation
     centroid_loader = DataLoader(full_ds, batch_size=args.batch_size, shuffle=False,
                                  num_workers=args.num_workers, pin_memory=True)
-    centroids = compute_class_centroids(model, centroid_loader, num_classes, device)
+    global_cent = compute_global_centroid(model, centroid_loader, device)
 
-    centroid_path = run_dir / "centroid_cache.npz"
-    np.savez(centroid_path, **{f"class_{k}": v for k, v in centroids.items()})
-    print(f"  Centroids saved to: {centroid_path}")
-    for c, name in enumerate(class_names):
-        if centroids[c].shape[0] > 1:
-            print(f"    class {c} ({name}): shape={centroids[c].shape}  "
-                  f"norm={np.linalg.norm(centroids[c]):.4f}")
+    centroid_path = run_dir / "global_centroid.npy"
+    np.save(centroid_path, global_cent)
+    print(f"  Global centroid saved to: {centroid_path} (norm={np.linalg.norm(global_cent):.4f})")
 
     print(f"\n  Done. All outputs in: {run_dir}\n")
 
