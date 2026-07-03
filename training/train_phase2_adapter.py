@@ -326,6 +326,7 @@ def parse_args():
     # Model Selection
     p.add_argument("--model", default="nnunet", choices=list(MODEL_REGISTRY.keys()), help="Must match the model used in Phase 1")
     p.add_argument("--no_adapter", action="store_true", help="Run frozen foundation only, no flow adapter (ablation baseline)")
+    p.add_argument("--use_pure_ce", action="store_true", help="Use pure CrossEntropyLoss (like the old CyL-Adapter code) instead of DiceCELoss.")
 
     # Adapter hyperparams
     p.add_argument("--adapter_train_cases", type=int, default=1,
@@ -453,7 +454,10 @@ def main():
             param.requires_grad = False
         foundation.eval()
 
-        seg_loss_fn = DiceCELoss(num_classes=num_classes)
+        if args.use_pure_ce:
+            seg_loss_fn = nn.CrossEntropyLoss()
+        else:
+            seg_loss_fn = DiceCELoss(num_classes=num_classes)
 
         eval_rows = []
         train_loss, train_dice = validate_foundation(
@@ -526,7 +530,12 @@ def main():
     print(f"  Flow params (trainable): {n_flow_params:,}\n")
 
     # ── load centroids and setup loss ──
-    seg_loss_fn = DiceCELoss(num_classes=num_classes)
+    if args.use_pure_ce:
+        print("  Using PURE CrossEntropyLoss for segmentation (old CyL-Adapter method).")
+        seg_loss_fn = nn.CrossEntropyLoss()
+    else:
+        print("  Using DiceCELoss for segmentation.")
+        seg_loss_fn = DiceCELoss(num_classes=num_classes)
     
     if args.centroid_cache and os.path.exists(args.centroid_cache):
         centroid_data = np.load(args.centroid_cache)

@@ -86,4 +86,10 @@ class CyLNormalizingFlow(nn.Module):
                 x = layer(x, reverse=True)
                 x = torch.flip(x, dims=[1])
                 
+        # If the number of layers is odd, the channels end up flipped. 
+        # We must flip them one last time to restore the original channel ordering, 
+        # ensuring the zero-initialized flow is a perfect Identity mapping.
+        if len(self.layers) % 2 != 0:
+            x = torch.flip(x, dims=[1])
+                
         return x
