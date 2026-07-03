@@ -89,6 +89,10 @@ class CyLAdapterLoss(nn.Module):
             else:
                 cine_centroid_flat = cine_centroid
                 
+            # Ensure it is at least 2D: (1, C)
+            if cine_centroid_flat.dim() == 1:
+                cine_centroid_flat = cine_centroid_flat.unsqueeze(0)
+                
             if cine_centroid_flat.size(0) == 1:
                 cine_centroid_flat = cine_centroid_flat.expand(z_aligned_flat.size(0), -1)
                 
