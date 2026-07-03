@@ -86,57 +86,7 @@ MODEL_REGISTRY = {
 # Loss
 # ─────────────────────────────────────────────
 
-class DiceCELoss(nn.Module):
-    def __init__(self, num_classes: int, ce_weight: float = 0.5, smooth: float = 1e-5):
-        super().__init__()
-        self.num_classes = num_classes
-        self.ce_weight = ce_weight
-        self.smooth = smooth
-        self.ce = nn.CrossEntropyLoss()
-
-    def forward(self, logits, targets):
-        ce_loss = self.ce(logits, targets)
-        probs = F.softmax(logits, dim=1)
-        targets_oh = F.one_hot(targets, self.num_classes)
-        dims = [0, targets_oh.dim() - 1] + list(range(1, targets_oh.dim() - 1))
-        targets_oh = targets_oh.permute(*dims).float()
-        probs_flat = probs.view(probs.shape[0], probs.shape[1], -1)
-        tgt_flat   = targets_oh.view(targets_oh.shape[0], targets_oh.shape[1], -1)
-        intersection = (probs_flat * tgt_flat).sum(-1)
-        dice_per_class = (2 * intersection + self.smooth) / \
-                         (probs_flat.sum(-1) + tgt_flat.sum(-1) + self.smooth)
-        dice_loss = 1.0 - dice_per_class.mean()
-        return (1 - self.ce_weight) * dice_loss + self.ce_weight * ce_loss
-
-
-class GlobalAlignmentLoss(nn.Module):
-    """
-    Combined alignment loss (MSE + L1 + Cosine) between the aligned bottleneck 
-    and the single global source-domain centroid.
-    """
-    def __init__(self, global_centroid: np.ndarray, device: torch.device):
-        super().__init__()
-        self.centroid = torch.tensor(global_centroid, dtype=torch.float32, device=device)
-        self.mse = nn.MSELoss()
-        self.l1 = nn.L1Loss()
-
-    def forward(self, z_aligned: torch.Tensor, labels=None):
-        """
-        z_aligned: (B, C, h, w) or (B, C, h, w, d)
-        labels: ignored (kept for API compatibility with old loops)
-        """
-        # Spatially average to get (B, C)
-        spatial_dims = list(range(2, z_aligned.dim()))
-        z_vec = z_aligned.mean(dim=spatial_dims)
-
-        # Expand centroid to batch size: (B, C)
-        c_batch = self.centroid.unsqueeze(0).expand(z_vec.size(0), -1)
-
-        loss_mse = self.mse(z_vec, c_batch)
-        loss_l1  = self.l1(z_vec, c_batch)
-        loss_cos = 1.0 - F.cosine_similarity(z_vec, c_batch, dim=1).mean()
-
-        return loss_mse + loss_l1 + loss_cos
+from training.losses import CyLAdapterLoss, DiceCELoss
 
 
 # ─────────────────────────────────────────────
@@ -192,11 +142,12 @@ def select_adapter_train_subset(dataset, n_cases: int, seed: int):
 # Train / Val loops
 # ─────────────────────────────────────────────
 
-def train_one_epoch(adapter, loader, optimizer, seg_loss_fn,
-                    align_loss_fn, lambda_align, device, num_classes):
-    adapter.train()   # foundation stays in eval via overridden train()
+def train_one_epoch(adapter, loader, optimizer, loss_fn,
+                    global_centroid, device, num_classes):
+    adapter.train()   # foundation stays in eval via overridden train() unless unfrozen
     total_seg   = 0.0
     total_align = 0.0
+    total_cycle = 0.0
     total_total = 0.0
     all_dice    = np.zeros(num_classes, dtype=np.float64)
     n_batches   = 0
@@ -209,9 +160,11 @@ def train_one_epoch(adapter, loader, optimizer, seg_loss_fn,
 
         logits, z_target, z_aligned = adapter(images)
 
-        l_seg   = seg_loss_fn(logits, labels)
-        l_align = align_loss_fn(z_aligned, labels)
-        loss    = l_seg + lambda_align * l_align
+        loss, l_seg, l_align, l_cycle = loss_fn(
+            preds=logits, targets=labels, z_aligned=z_aligned, 
+            cine_centroid=global_centroid, z_lge_original=z_target, 
+            T_flow_module=adapter.T_flow
+        )
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(adapter.T_flow.parameters(), max_norm=1.0)
@@ -222,6 +175,7 @@ def train_one_epoch(adapter, loader, optimizer, seg_loss_fn,
 
         total_seg   += l_seg.item()
         total_align += l_align.item()
+        total_cycle += l_cycle.item()
         total_total += loss.item()
         all_dice    += dice
         n_batches   += 1
@@ -229,15 +183,16 @@ def train_one_epoch(adapter, loader, optimizer, seg_loss_fn,
     return (total_total / n_batches,
             total_seg   / n_batches,
             total_align / n_batches,
+            total_cycle / n_batches,
             all_dice    / n_batches)
 
 
 @torch.no_grad()
-def validate(adapter, loader, seg_loss_fn, align_loss_fn,
-             lambda_align, device, num_classes):
+def validate(adapter, loader, loss_fn, global_centroid, device, num_classes):
     adapter.eval()
     total_seg   = 0.0
     total_align = 0.0
+    total_cycle = 0.0
     total_total = 0.0
     all_dice    = np.zeros(num_classes, dtype=np.float64)
     n_batches   = 0
@@ -246,17 +201,20 @@ def validate(adapter, loader, seg_loss_fn, align_loss_fn,
         images = batch["image"].to(device)
         labels = batch["label"].to(device)
 
-        logits, _, z_aligned = adapter(images)
+        logits, z_target, z_aligned = adapter(images)
 
-        l_seg   = seg_loss_fn(logits, labels)
-        l_align = align_loss_fn(z_aligned, labels)
-        loss    = l_seg + lambda_align * l_align
+        loss, l_seg, l_align, l_cycle = loss_fn(
+            preds=logits, targets=labels, z_aligned=z_aligned, 
+            cine_centroid=global_centroid, z_lge_original=z_target, 
+            T_flow_module=adapter.T_flow
+        )
 
         preds = logits.argmax(dim=1)
         dice  = compute_dice_per_class(preds.cpu(), labels.cpu(), num_classes)
 
         total_seg   += l_seg.item()
         total_align += l_align.item()
+        total_cycle += l_cycle.item()
         total_total += loss.item()
         all_dice    += dice
         n_batches   += 1
@@ -264,6 +222,7 @@ def validate(adapter, loader, seg_loss_fn, align_loss_fn,
     return (total_total / n_batches,
             total_seg   / n_batches,
             total_align / n_batches,
+            total_cycle / n_batches,
             all_dice    / n_batches)
 
 
@@ -331,13 +290,16 @@ def parse_args():
     # Adapter hyperparams
     p.add_argument("--adapter_train_cases", type=int, default=1,
                    help="Number of target cases for adapter training. -1 = all.")
+    p.add_argument("--unfreeze_foundation", action="store_true", help="Unfreeze the foundation model during Phase 2 (Supervised Fine-Tuning)")
     p.add_argument("--num_flow_layers",   type=int,   default=3)
     p.add_argument("--epochs",            type=int,   default=100)
     p.add_argument("--batch_size",        type=int,   default=8)
     p.add_argument("--lr",                type=float, default=1e-4)
     p.add_argument("--weight_decay",      type=float, default=1e-5)
-    p.add_argument("--lambda_align",      type=float, default=0.5,
-                   help="Weight for centroid alignment loss")
+    p.add_argument("--lambda_align",      type=float, default=0.01,
+                   help="Weight for MMD centroid alignment loss")
+    p.add_argument("--lambda_cycle",      type=float, default=0.01,
+                   help="Weight for Cycle Consistency loss")
     p.add_argument("--num_workers",       type=int,   default=4)
     p.add_argument("--device",            default="cuda:0")
     p.add_argument("--seed",              type=int,   default=42)
@@ -530,30 +492,44 @@ def main():
     print(f"  Flow params (trainable): {n_flow_params:,}\n")
 
     # ── load centroids and setup loss ──
-    if args.use_pure_ce:
-        print("  Using PURE CrossEntropyLoss for segmentation (old CyL-Adapter method).")
-        seg_loss_fn = nn.CrossEntropyLoss()
-    else:
-        print("  Using DiceCELoss for segmentation.")
-        seg_loss_fn = DiceCELoss(num_classes=num_classes)
-    
+    global_centroid_data = None
     if args.centroid_cache and os.path.exists(args.centroid_cache):
-        centroid_data = np.load(args.centroid_cache)
+        global_centroid_data = torch.tensor(np.load(args.centroid_cache), dtype=torch.float32, device=device)
         print(f"  Loaded global centroid from: {args.centroid_cache}")
-        align_loss_fn = GlobalAlignmentLoss(centroid_data, device)
     else:
-        print("  No centroid provided. Using PURE task loss (lambda_align = 0.0)")
+        print("  No centroid provided. Using PURE task loss + Cycle (lambda_align = 0.0)")
         args.lambda_align = 0.0
-        align_loss_fn = lambda z, y: torch.tensor(0.0, device=device)
+        
+    loss_fn = CyLAdapterLoss(
+        num_classes=num_classes, 
+        mmd_weight=args.lambda_align, 
+        cycle_weight=args.lambda_cycle, 
+        use_pure_ce=args.use_pure_ce
+    )
 
-    # ── optimiser — ONLY flow params ──
-    optimizer = Adam(adapter.T_flow.parameters(), lr=args.lr,
-                     weight_decay=args.weight_decay)
+    # ── optimiser ──
+    if args.unfreeze_foundation:
+        print("  UNFREEZING Foundation Model for Supervised Fine-Tuning!")
+        for param in adapter.foundation.parameters():
+            param.requires_grad = True
+        
+        optimizer = Adam([
+            {'params': adapter.T_flow.parameters(), 'lr': args.lr},
+            {'params': adapter.T_inv_flow.parameters(), 'lr': args.lr},
+            {'params': adapter.foundation.parameters(), 'lr': 1e-5}
+        ], weight_decay=args.weight_decay)
+    else:
+        print("  Foundation Model remains strictly FROZEN.")
+        optimizer = Adam([
+            {'params': adapter.T_flow.parameters()},
+            {'params': adapter.T_inv_flow.parameters()}
+        ], lr=args.lr, weight_decay=args.weight_decay)
+
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
     # ── CSV logger ──
     fieldnames = (
-        ["epoch", "phase", "loss_total", "loss_seg", "loss_align",
+        ["epoch", "phase", "loss_total", "loss_seg", "loss_align", "loss_cycle",
          "mean_dice", "lr", "epoch_time_s"]
         + [f"dice_{c}" for c in class_names]
     )
@@ -571,23 +547,23 @@ def main():
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
 
-        (tr_loss, tr_seg, tr_align,
+        (tr_loss, tr_seg, tr_align, tr_cycle,
          tr_dice) = train_one_epoch(
             adapter, train_loader, optimizer,
-            seg_loss_fn, align_loss_fn, args.lambda_align,
+            loss_fn, global_centroid_data,
             device, num_classes)
 
         if has_val:
-            (vl_loss, vl_seg, vl_align,
+            (vl_loss, vl_seg, vl_align, vl_cycle,
              vl_dice) = validate(
                 adapter, val_loader,
-                seg_loss_fn, align_loss_fn, args.lambda_align,
+                loss_fn, global_centroid_data,
                 device, num_classes)
             monitor_dice = float(np.mean(vl_dice[1:]))
         else:
             # no val cases (pure one-shot with only 1 case total):
             # monitor training dice instead
-            vl_loss = vl_seg = vl_align = tr_loss
+            vl_loss = vl_seg = vl_align = vl_cycle = tr_loss
             vl_dice = tr_dice
             monitor_dice = float(np.mean(tr_dice[1:]))
 
@@ -596,9 +572,9 @@ def main():
         current_lr = scheduler.get_last_lr()[0]
 
         # ── log ──
-        for phase, loss, seg, align, dice in [
-            ("train", tr_loss, tr_seg, tr_align, tr_dice),
-            ("val",   vl_loss, vl_seg, vl_align, vl_dice),
+        for phase, loss, seg, align, cycle, dice in [
+            ("train", tr_loss, tr_seg, tr_align, tr_cycle, tr_dice),
+            ("val",   vl_loss, vl_seg, vl_align, vl_cycle, vl_dice),
         ]:
             row = {
                 "epoch":        epoch,
@@ -606,6 +582,7 @@ def main():
                 "loss_total":   round(loss,  6),
                 "loss_seg":     round(seg,   6),
                 "loss_align":   round(align, 6),
+                "loss_cycle":   round(cycle, 6),
                 "mean_dice":    round(float(np.mean(dice[1:])), 6),
                 "lr":           round(current_lr, 8),
                 "epoch_time_s": round(epoch_time, 2),

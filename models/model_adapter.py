@@ -22,6 +22,9 @@ class CyLAdapterModel(nn.Module):
         # Initialize the dynamic Forward Flow engine
         self.T_flow = CyLNormalizingFlow(dim=dim, channels=self.foundation.bottleneck_channels, num_layers=num_flow_layers)
         
+        # Initialize the Inverse Flow at the output feature space
+        self.T_inv_flow = CyLNormalizingFlow(dim=dim, channels=self.foundation.base_filters, num_layers=num_flow_layers)
+        
     def forward_foundation(self, x):
         """
         Standard forward pass for pure Source Data.
@@ -42,8 +45,14 @@ class CyLAdapterModel(nn.Module):
         # 2. Warp Target Latent into Source Domain
         z_source_aligned = self.T_flow(z_target, reverse=False)
         
-        # 3. Decode Aligned Latent using Frozen Source Decoder
-        logits, _ = self.foundation.decode(skips, z_source_aligned)
+        # 3. Decode Aligned Latent using Source Decoder
+        _, source_features = self.foundation.decode(skips, z_source_aligned)
+        
+        # 4. Warp Output Features back to Target Domain
+        target_features = self.T_inv_flow(source_features, reverse=True)
+        
+        # 5. Classify
+        logits = self.foundation.head(target_features)
         
         return logits, z_target, z_source_aligned
 
